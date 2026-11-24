@@ -1,9 +1,10 @@
-
 import re
 import unicodedata
 
 import pandas as pd
 from rapidfuzz import fuzz
+
+MATCH_MODES = ("recommended", "strict")
 
 
 def normalize_value(value):
@@ -101,9 +102,19 @@ def run_match(
     src_keys,
     dst_keys,
     threshold=90,
-    margin=5
+    margin=5,
+    mode="recommended"
 ):
-    """Match destination rows against source rows."""
+    """Match destination rows against source rows.
+
+    mode="recommended": exact, then normalized, then fuzzy suggestions.
+    mode="strict": exact matches only. There is no normalized pass, no fuzzy pass and no
+    similarity score, and threshold and margin are ignored. Duplicate and invalid-key
+    detection are unchanged.
+    """
+
+    if mode not in MATCH_MODES:
+        raise ValueError("Invalid matching mode.")
 
     if not src_keys or not dst_keys:
         raise ValueError("At least one matching column is required.")
@@ -164,6 +175,12 @@ def run_match(
                 result["_src_index"] = matches[0]
                 result["status"] = "EXACT"
                 claimed_sources.add(matches[0])
+
+    # Strict mode stops after the exact pass.
+    if mode == "strict":
+        result_df = pd.DataFrame(results)
+
+        return result_df, result_df["status"].value_counts().to_dict()
 
     # Build normalized source lookup
     normalized_lookup = {}
