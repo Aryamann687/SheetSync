@@ -4,6 +4,8 @@ Design rules (see the architecture review):
 
 * Every source is matched against the destination exactly as uploaded. Sources never see
   values that another source would fill, so the order of sources never changes a result.
+* Each source is matched with its own `MatchSettings` (mode, threshold, margin) through
+  `match_source()`, so different sources can use different matching modes independently.
 * Sources interact in one place only: `consolidate()` merges their cell updates and detects
   collisions. Nothing here writes a cell; updates come from `core.updater.build_plan` and are
   applied by `core.updater.apply_plan`, called exactly once, from `apply_consolidated()`.
@@ -29,11 +31,14 @@ from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 
+from core.matcher import MATCH_MODES, run_match
 from core.updater import apply_plan, build_plan
 
 HIDDEN = "_xl_row"  # internal column added by core.reader.load_table
 STRATEGIES = ("fill_only_blank", "overwrite")
 MATCHED_STATUSES = ("EXACT", "NORMALIZED")
+# the only statuses a strict-mode match can produce (no normalized, possible or unclear matches)
+STRICT_STATUSES = frozenset({"EXACT", "DUPLICATE_SOURCE", "DUPLICATE_DEST", "INVALID_KEY", "UNMATCHED"})
 
 # matcher status code -> (result label, detail wording); shared by the report and the app
 STATUS_LABELS = {
@@ -65,9 +70,19 @@ CONFLICT_COLUMNS = ("Row", "Column", "Current value", "Source file", "Proposed v
 # ---------------------------------------------------------------- data types
 @dataclass(frozen=True)
 class MatchSettings:
-    """Opaque matching numbers passed to core.matcher.run_match by the caller."""
+    """How one source is matched; passed to core.matcher.run_match by `match_source()`.
+
+    `mode` is "recommended" (default: exact, normalized and possible matches) or "strict" (exact
+    matches only; threshold and margin are then ignored by the matcher). Supported modes are the
+    matcher's own `MATCH_MODES`.
+    """
     threshold: int
     margin: int
+    mode: str = "recommended"
+
+    def __post_init__(self):
+        if self.mode not in MATCH_MODES:
+            raise ValueError(f"Invalid matching mode: {self.mode!r}. Use one of: {', '.join(MATCH_MODES)}.")
 
 
 @dataclass(frozen=True)
@@ -385,6 +400,20 @@ def validate_setup(specs: Sequence[SourceSpec], dest_columns: Iterable[str],
     return issues
 
 
+# ---------------------------------------------------------------- per-source matching
+def match_source(destination: Destination, spec: SourceSpec, table: pd.DataFrame) -> pd.DataFrame:
+    """Run core.matcher.run_match for one source with that source's own settings.
+
+    The source is matched against the destination exactly as uploaded, using the spec's key
+    columns and its `MatchSettings` (mode, threshold, margin). Returns the result_df that
+    `SourceEntry.match_result` expects. Errors from run_match are passed through unchanged.
+    """
+    result, _summary = run_match(
+        table, destination.table, list(spec.src_keys), list(spec.dst_keys),
+        threshold=spec.settings.threshold, margin=spec.settings.margin, mode=spec.settings.mode)
+    return result
+
+
 # ---------------------------------------------------------------- per-source plan
 def build_source_plan(destination: Destination, entry: SourceEntry) -> SourcePlan:
     """Call core.updater.build_plan for one source against the original destination.
@@ -436,6 +465,12 @@ def consolidate(destination: Destination, entries: Sequence[SourceEntry]) -> Con
     for e in active:
         sid, label = e.spec.source_id, e.spec.label
         reasons = list(setup_errors.get(sid, []))
+        if (e.spec.settings.mode == "strict" and e.match_result is not None
+                and not set(e.match_result["status"]) <= STRICT_STATUSES):
+            # a strict match can never produce these statuses, so the results are stale or came
+            # from a different mode: never let possible matches through a strict source
+            reasons.append("The matching results for this file were produced with different matching "
+                           "settings. Find matching records again.")
         if e.problem:
             reasons.append(e.problem)
         elif e.plan is None:
