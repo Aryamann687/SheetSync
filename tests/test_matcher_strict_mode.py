@@ -223,14 +223,13 @@ def test_matching_report_and_consolidation_show_strict_results_correctly():
     assert c.can_apply and len(c.updates) == 5 and c.summaries[0].needs_review == 0
 
 
-# ---------------------------------------------------------------- the UI passes the mode explicitly
-def test_every_run_match_call_in_app_py_passes_the_matching_mode():
+# ---------------------------------------------------------------- the UI goes through the consolidation layer
+def test_app_py_matches_through_the_consolidation_layer_which_carries_each_sources_mode():
     app = ROOT / "app.py"
     if not app.exists():
         return
     tree = ast.parse(app.read_text())
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-             and getattr(n.func, "id", getattr(n.func, "attr", None)) == "run_match"]
-    assert calls, "app.py should call run_match"
-    assert all("mode" in {k.arg for k in c.keywords} for c in calls)
+    called = {getattr(n.func, "id", getattr(n.func, "attr", None)) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert "match_source" in called and "apply_consolidated" in called
+    assert not {"run_match", "build_plan", "apply_plan"} & called      # no bypassing the consolidator
     assert "STRICT" not in {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}

@@ -1,8 +1,10 @@
-"""SheetSync — Streamlit interface (plain-language edition).
+"""SheetSync — Streamlit interface (simple column-transfer edition).
 
-UI only. Calls core.reader / core.matcher / core.updater as implemented; the backend is unchanged.
+UI only. One source file and one destination workbook; matching, planning, safety checks and applying
+all go through core.consolidator (a single source), and the backend is unchanged.
 """
 import hashlib
+import html
 import io
 import os
 
@@ -10,8 +12,10 @@ import pandas as pd
 import streamlit as st
 
 from core.reader import list_sheets, load_table
-from core.matcher import run_match
-from core.updater import build_plan, apply_plan
+from core.consolidator import (
+    STATUS_LABELS, MatchSettings, SourceEntry, SourceSpec, apply_consolidated, build_source_plan, consolidate,
+    make_destination, match_source, matching_report_csv, unused_source_records, validate_setup,
+)
 
 st.set_page_config(page_title="SheetSync", layout="wide", initial_sidebar_state="collapsed")
 
@@ -53,6 +57,10 @@ hr{border:none; border-top:1px solid var(--line); margin:2.1rem 0 1.6rem !import
   border-radius:999px; padding:.28rem .75rem; font-size:.85rem;}
 .chip i{width:.55rem; height:.55rem; border-radius:50%; display:inline-block;}
 .chip b{font-weight:600;}
+.stats{display:flex; gap:.75rem; flex-wrap:wrap; margin:.4rem 0 1rem;}
+.stat{background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:.8rem 1.1rem; min-width:9.5rem;}
+.stat b{display:block; font-size:1.5rem; font-weight:600; line-height:1.2;}
+.stat span{color:var(--muted); font-size:.85rem;}
 .note{background:var(--accent-soft); border-radius:var(--r); padding:.7rem 1rem; font-size:.9rem; color:var(--accent-ink);}
 :focus-visible{outline:2px solid var(--accent) !important; outline-offset:2px;}
 </style>
@@ -62,31 +70,11 @@ hr{border:none; border-top:1px solid var(--line); margin:2.1rem 0 1.6rem !import
 
 # ---------------------------------------------------------------- constants
 # core.matcher status code -> (result label, dot colour, detail wording)
-STATUS = {
-    "EXACT": ("Matched", "#3F7F7A", "Exact match"),
-    "NORMALIZED": ("Matched", "#3F7F7A", "Match after ignoring formatting differences"),
-    "FUZZY": ("Needs review", "#C49A4A", "Possible match"),
-    "AMBIGUOUS": ("Unclear", "#B77E5C", "Several similar records found"),
-    "DUPLICATE_SOURCE": ("Duplicate", "#8C9196", "Duplicate in source file"),
-    "DUPLICATE_DEST": ("Duplicate", "#8C9196", "Duplicate in destination file"),
-    "INVALID_KEY": ("Invalid information", "#A65F5F", "Identifying information is missing"),
-    "UNMATCHED": ("Not found", "#B3AEA3", "No match found"),
-}
-RESULTS = {  # result label -> (dot colour, what it means)
-    "Matched": ("#3F7F7A", "A corresponding record was found."),
-    "Needs review": ("#C49A4A", "A possible match was found and needs your confirmation."),
-    "Unclear": ("#B77E5C", "Several similar records were found, so none was chosen. Nothing is copied."),
-    "Not found": ("#B3AEA3", "No corresponding record was found."),
-    "Duplicate": ("#8C9196", "Multiple records have the same identifying information. Nothing is copied."),
-    "Invalid information": ("#A65F5F", "Some identifying information is missing."),
-}
 STRATEGIES = {  # shown to the user -> core.updater strategy
     "Only fill empty cells": "fill_only_blank",
     "Replace existing values": "overwrite",
 }
 HIDDEN = "_xl_row"  # internal column added by core.reader; never shown or mapped
-MODES = ["Recommended", "Strict matching"]
-MATCH_MODE = {"Recommended": "recommended", "Strict matching": "strict"}  # -> run_match(mode=...)
 
 SKIP_REASONS = {  # core.updater skip reason -> plain wording
     "Missing source row": "No matching record in the source file",
@@ -96,7 +84,7 @@ SKIP_REASONS = {  # core.updater skip reason -> plain wording
     "Destination already contains a value": "The destination cell already has a value",
 }
 ERRORS = [  # (text found in the backend message, instruction for the user)
-    ("column headers are missing", "We couldn't identify all column names. Check that the row you chose under Row containing column names has a name in every column."),
+    ("column headers are missing", "We couldn't identify all column names. Open \"My column names are not in row 1\" and enter the row that has a name for every column."),
     ("duplicate column headers", "Two or more columns have the same name. Give every column a unique name, then upload the file again."),
     ("reserved column name", "One column is named _xl_row, which SheetSync uses internally. Rename it, then upload the file again."),
     ("contains no data", "We couldn't find any data. Check that you chose the right sheet and that the column names are above your data."),
@@ -140,7 +128,7 @@ def _friendly(e, fallback):
 def _skip_reason(reason):
     if reason.startswith("Match status: "):
         code = reason.split(": ", 1)[1]
-        return "Possible match not confirmed" if code == "FUZZY" else STATUS.get(code, (0, 0, reason))[2]
+        return "Possible match not confirmed" if code == "FUZZY" else STATUS_LABELS.get(code, (None, reason))[1]
     return SKIP_REASONS.get(reason, reason)
 
 
@@ -176,45 +164,8 @@ def _cols(df):
     return [c for c in df.columns if c != HIDDEN]
 
 
-def _xl_row(df, idx):
-    """Excel row number for a DataFrame index label; blank when there is none."""
-    if idx is None or pd.isna(idx):
-        return ""
-    try:
-        return int(df.loc[idx, HIDDEN])
-    except (KeyError, TypeError, ValueError):
-        pass
-    try:
-        return int(df.loc[int(idx), HIDDEN])
-    except (KeyError, TypeError, ValueError):
-        return ""
 
 
-@st.cache_data(show_spinner=False)
-def _report_csv(sig, approved, _res, _src_df, _dst_df, src_keys, dst_keys):
-    """Matching report: one row per destination row. `sig` and `approved` identify the inputs for caching."""
-    accepted = set(approved)
-    rows = []
-    for _, r in _res.iterrows():
-        status = r["status"]
-        dst_index = r["_dst_index"]
-        src_index = r["_src_index"] if status in ("EXACT", "NORMALIZED") else r["_suggested_src_index"]
-        score = r["match_score"]
-        if status == "FUZZY":
-            decision = "Confirmed" if dst_index in accepted else "Not confirmed"
-        else:
-            decision = "Not needed"
-        rows.append({
-            "Row in destination file": _xl_row(_dst_df, dst_index),
-            "Record in destination file": _text(_dst_df, dst_index, dst_keys),
-            "Result": STATUS[status][0],
-            "Details": STATUS[status][2],
-            "Row in source file": _xl_row(_src_df, src_index),
-            "Record in source file": _text(_src_df, src_index, src_keys),
-            "Similarity (0-100)": "" if pd.isna(score) else round(float(score), 1),
-            "Your decision": decision,
-        })
-    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
 
 
 def _blank(v):
@@ -231,271 +182,305 @@ def _note(text, top=False):
     st.markdown(f'<div class="note"{style}>{text}</div>', unsafe_allow_html=True)
 
 
-def _upload_block(title, help_text, types, key):
-    """Uploader, sheet picker and header row for one file. Returns (name, bytes, sheet, header_row, df), or Nones."""
-    st.markdown(f"**{title}**")
-    st.caption(help_text)
-    up = st.file_uploader(title, type=types, key=f"up_{key}", label_visibility="collapsed")
-    if up is None:
-        return None, None, None, None, None
+# ---------------------------------------------------------------- helpers for the simple page
+PH = "Choose a column"      # first option of every column picker
+SOURCE_ID = "s1"            # the simple page uses exactly one source
+
+
+def _rerun():
+    (getattr(st, "rerun", None) or st.experimental_rerun)()
+
+
+def _digest(data):
+    return hashlib.md5(data).hexdigest()
+
+
+def _tag(text):
+    return f'<span class="chip">{html.escape(str(text))}</span>'
+
+
+def _download(label, data, **kw):
+    try:
+        return st.download_button(label, data, type="primary", **kw)
+    except TypeError:  # older Streamlit versions have no button types
+        return st.download_button(label, data, **kw)
+
+
+# Results depend only on the files and choices, so they are cached by a signature of those inputs.
+@st.cache_data(show_spinner=False)
+def _match(sig, _dest, _spec, _table):
+    return match_source(_dest, _spec, _table)
+
+
+@st.cache_data(show_spinner=False)
+def _plan(sig, _dest, _entry):
+    return build_source_plan(_dest, _entry)
+
+
+@st.cache_data(show_spinner=False)
+def _workbook(sig, _dest, _cons):
+    return apply_consolidated(_dest, _cons)
+
+
+@st.cache_data(show_spinner=False)
+def _report(sig, _dest, _entries):
+    return matching_report_csv(_dest, _entries)
+
+
+@st.cache_data(show_spinner=False)
+def _unused(sig, _entry):
+    return unused_source_records(_entry)
+
+
+def _file_inputs(key, up):
+    """Sheet, column-name row and loaded table for one uploaded file; shows the columns found."""
     name, data = up.name, up.getvalue()
     try:
         sheets = _sheets(name, data)
-        sheet = st.selectbox("Sheet", sheets, key=f"sheet_{key}") if len(sheets) > 1 else sheets[0]
-        header_row = st.number_input("Row containing column names", min_value=1, value=1, step=1, key=f"hdr_{key}",
-                                     help="Usually row 1. Change this if your column names start further down.")
-        df = _load(name, data, sheet, int(header_row))
+        sheet = st.selectbox("Sheet", sheets, key=f"{key}_sheet") if len(sheets) > 1 else sheets[0]
+        with st.expander("My column names are not in row 1"):
+            hdr = int(st.number_input("Row that contains the column names", min_value=1, value=1, step=1, key=f"{key}_hdr"))
+        table = _load(name, data, sheet, hdr)
     except Exception as e:
-        st.error(_friendly(e, f"We couldn't read {name}. Check that the file isn't password-protected "
-                              "and that the sheet and header row are correct."))
-        return None, None, None, None, None
-    st.caption(f"{len(df):,} rows and {len(_cols(df))} columns found")
-    with st.expander("Preview the first rows"):
-        _wide(st.dataframe, df[_cols(df)].head(8), hide_index=True)
-    return name, data, sheet, int(header_row), df
+        msg = _friendly(e, f"We couldn't read {name}. Check that the file isn't password-protected "
+                           "and that the sheet and column-name row are correct.")
+        st.error(msg)
+        return {"name": name, "data": data, "error": msg}
+    cols = _cols(table)
+    st.markdown(f"Found **{len(table):,} row{'s' if len(table) != 1 else ''}** and "
+                f"**{len(cols)} column{'s' if len(cols) != 1 else ''}**:")
+    st.markdown('<div class="chips">' + "".join(_tag(c) for c in cols) + "</div>", unsafe_allow_html=True)
+    return {"name": name, "data": data, "sheet": sheet, "hdr": hdr, "table": table, "error": None}
+
+
+def _row_picker(prefix, rid, src_cols, dst_cols, removable, default=None, auto_dest=False):
+    """One row of two column pickers. Returns (source column, destination column, remove clicked)."""
+    ss, ks, kd = st.session_state, f"{prefix}s_{rid}", f"{prefix}d_{rid}"
+    if auto_dest:  # when the source column changes, pre-pick the destination column with the same name
+        now = ss.get(ks, PH)
+        if ss.get(f"{prefix}prev_{rid}") != now:
+            ss[f"{prefix}prev_{rid}"] = now
+            if now != PH:
+                ss[kd] = now if now in dst_cols else PH
+    c1, c2, c3 = st.columns([5, 5, 1], gap="medium")
+    s = c1.selectbox("Column in the source file", [PH] + src_cols, key=ks, label_visibility="collapsed",
+                     index=1 + src_cols.index(default) if default else 0)
+    d = c2.selectbox("Column in the destination file", [PH] + dst_cols, key=kd, label_visibility="collapsed",
+                     index=1 + dst_cols.index(default) if default else 0)
+    gone = bool(removable and c3.button("Remove", key=f"{prefix}rm_{rid}"))
+    return s, d, gone
+
+
+def _forget_row(ss, kind, prefix, rid):
+    ss[kind].remove(rid)
+    for k in (f"{prefix}s_{rid}", f"{prefix}d_{rid}", f"{prefix}prev_{rid}"):
+        ss.pop(k, None)
+
+
+def _stats(matched, cells, unmatched):
+    box = lambda n, label: f'<div class="stat"><b>{n:,}</b><span>{label}</span></div>'
+    st.markdown('<div class="stats">' + box(matched, "Records matched") + box(cells, "Cells to update")
+                + box(unmatched, "Records not matched") + "</div>", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- header
+ss = st.session_state
+ss.setdefault("match_rows", [1])   # ids of the "match rows using" pickers
+ss.setdefault("copy_rows", [2])    # ids of the "copy these columns" pickers
+ss.setdefault("next_row", 3)
 st.markdown("# SheetSync")
-st.markdown(
-    '<p class="sub">Fill in an Excel workbook with information from another file by matching records.</p>',
-    unsafe_allow_html=True,
-)
+st.markdown('<p class="sub">Copy columns from one Excel file into another, matching rows by a column they share.</p>',
+            unsafe_allow_html=True)
 st.divider()
 
-# ---------------------------------------------------------------- 1. upload
-_step(1, "Upload your files",
-      "Choose the file with the information you want to copy and the Excel workbook you want to fill in. "
-      "Your original files are never changed.")
-c1, c2 = st.columns(2, gap="large")
-with c1:
-    src_name, src_bytes, src_sheet, src_hdr, src_df = _upload_block(
-        "Source file", "The file that has the information to copy. Excel or CSV.", ["xlsx", "csv"], "src")
-with c2:
-    dst_name, dst_bytes, dst_sheet, dst_hdr, dst_df = _upload_block(
-        "Destination workbook", "The Excel workbook you want to fill in.", ["xlsx"], "dst")
-
-if src_df is None or dst_df is None:
+# ---------------------------------------------------------------- 1. source file
+_step(1, "Upload the file you want to copy from", "Choose the Excel or CSV file that has the information you want to copy.")
+src_up = st.file_uploader("Source file", type=["xlsx", "csv"], key="src_up", label_visibility="collapsed")
+src = _file_inputs("src", src_up) if src_up is not None else None
+if src is None or src["error"]:
     st.stop()
 
-# ---------------------------------------------------------------- 2. matching
+# ---------------------------------------------------------------- 2. destination file
 st.divider()
-_step(2, "Identify matching records",
-      "Choose the columns that help us identify the same record in both files. "
-      "Select them in the same order on each side. For example, choose District in both files.")
-k1, k2 = st.columns(2, gap="large")
-src_keys = k1.multiselect("Columns that identify a record in the source file", _cols(src_df), key="src_keys")
-dst_keys = k2.multiselect("Matching columns in the destination file", _cols(dst_df), key="dst_keys")
+_step(2, "Upload the workbook you want to update",
+      "Choose the Excel workbook to fill in. Your original is never changed. You will download an updated copy.")
+dst_up = st.file_uploader("Destination workbook", type=["xlsx"], key="dst_up", label_visibility="collapsed")
+dst = _file_inputs("dst", dst_up) if dst_up is not None else None
+if dst is None or dst["error"]:
+    st.stop()
+dest = make_destination(dst["data"], dst["sheet"], dst["hdr"], dst["table"])
+src_cols, dst_cols = _cols(src["table"]), _cols(dest.table)
 
-keys_ok = bool(src_keys) and len(src_keys) == len(dst_keys)
-if src_keys and dst_keys and len(src_keys) != len(dst_keys):
-    st.warning("Select the same number of columns on both sides.")
+# ---------------------------------------------------------------- 3. select columns
+st.divider()
+_step(3, "Select columns", "Choose how to find the same row in both files, then which columns to copy.")
+head = st.columns([5, 5, 1], gap="medium")
+head[0].caption("Column in the source file")
+head[1].caption("Column in the destination file")
 
-mode = st.radio("How should records be matched?", MODES, horizontal=True, key="mode")
-strict = mode != "Recommended"
-st.markdown(
-    '<p class="hint">' + (
-        "Only matches records whose selected information is exactly the same, including capital letters, spaces and punctuation. "
-        "Nothing is suggested or guessed."
-        if strict else
-        "Also finds records that look slightly different, such as spelling or formatting variations. "
-        "You confirm each of these before anything is copied.") + "</p>",
-    unsafe_allow_html=True,
-)
-with st.expander("Advanced matching settings"):
-    if strict:
-        st.caption("These settings apply to Recommended matching only.")
-    loose = st.slider("How closely should records match?", 50, 100, 90, disabled=strict,
-                      help="Higher: only very similar records are suggested. Lower: more records are suggested.")
-    gap = st.slider("Difference between possible matches", 0, 20, 5, disabled=strict,
-                    help="If two records look almost equally likely, none is chosen for you. A higher number makes this more cautious.")
-match_mode = MATCH_MODE[mode]
+st.markdown("**Match rows using**")
+st.caption("Pick the column that identifies the same row in both files, such as District or Employee ID.")
+common = next((c for c in src_cols if c in dst_cols), None)
+match_raw, gone = [], None
+for n, rid in enumerate(ss["match_rows"]):
+    s, d, rm = _row_picker("m", rid, src_cols, dst_cols, n > 0, default=common if n == 0 else None)
+    match_raw.append((s, d))
+    gone = ("match_rows", "m", rid) if rm else gone
+if st.button("+ Add another matching column", key="add_match"):
+    ss["match_rows"].append(ss["next_row"])
+    ss["next_row"] += 1
+    _rerun()
 
-match_sig = _sig(src_name, hashlib.md5(src_bytes).hexdigest(), src_sheet, dst_name, hashlib.md5(dst_bytes).hexdigest(), dst_sheet,
-                 tuple(src_keys), tuple(dst_keys), match_mode, None if strict else (loose, gap),
-                 src_hdr, dst_hdr)
+st.markdown("**Copy these columns**")
+st.caption("Pick a column to copy from the source file and the column to fill in the destination.")
+copy_raw = []
+for n, rid in enumerate(ss["copy_rows"]):
+    s, d, rm = _row_picker("c", rid, src_cols, dst_cols, n > 0, auto_dest=True)
+    copy_raw.append((s, d))
+    gone = ("copy_rows", "c", rid) if rm else gone
+if st.button("+ Add another column", key="add_copy"):
+    ss["copy_rows"].append(ss["next_row"])
+    ss["next_row"] += 1
+    _rerun()
+if gone:
+    _forget_row(ss, *gone)
+    _rerun()
 
-m = st.session_state.get("match")
-if m and m["sig"] != match_sig:  # files or settings changed: drop the results and any plan built from them
-    st.session_state.pop("match", None)
-    st.session_state.pop("plan", None)
-    st.session_state["stale"], st.session_state["plan_stale"] = True, False
+with st.expander("More options"):
+    replace = st.checkbox("Replace values that are already in the destination", key="opt_replace",
+                          help="Leave this unticked to fill empty cells only. Existing values are then never touched.")
+    exact = st.checkbox("Only match rows that are exactly the same", key="opt_exact",
+                        help="Otherwise rows that differ only in capital letters, spaces or small spelling differences "
+                             "can still be matched. Rows that only look similar are always shown for you to confirm first.")
 
-if st.button("Find matching records", type="primary", disabled=not keys_ok):
-    try:
-        with st.spinner("Looking for matching records"):
-            result_df, summary = run_match(src_df, dst_df, src_keys, dst_keys, threshold=loose, margin=gap, mode=match_mode)
-        st.session_state["match"] = {"sig": match_sig, "result": result_df, "summary": summary}
-        st.session_state["stale"] = False
-    except Exception as e:
-        st.error(_friendly(e, "We couldn't compare the two files. Check the columns you selected and try again."))
-
-m = st.session_state.get("match")
-if not m:
-    if st.session_state.get("stale"):
-        _note("Your files or settings have changed. Select Find matching records to update the results.", top=True)
+match_pairs = [(s, d) for s, d in match_raw if s != PH and d != PH]
+copy_pairs = [(s, d) for s, d in copy_raw if s != PH and d != PH]
+problems = []
+if any((s == PH) != (d == PH) for s, d in match_raw + copy_raw):
+    problems.append("Choose a column on both sides of each row, or remove the row.")
+if len({s for s, _ in copy_pairs}) != len(copy_pairs):
+    problems.append("Each source column can only be copied once.")
+if not match_pairs or not copy_pairs:
+    if not problems:
+        st.caption("Choose the matching columns and at least one column to copy to see a preview.")
+    for message in problems:
+        st.error(message)
     st.stop()
 
-res = m["result"]
-labels = res["status"].map(lambda s: STATUS[s][0])
-counts = labels.value_counts()
-st.markdown(f"**Found a match for {int(counts.get('Matched', 0)):,} of {len(res):,} records in the destination file.**")
-chips = "".join(
-    f'<span class="chip"><i style="background:{col}"></i>{label} <b>{int(counts[label])}</b></span>'
-    for label, (col, _) in RESULTS.items() if counts.get(label, 0)
-)
-st.markdown(f'<div class="chips">{chips}</div>', unsafe_allow_html=True)
+spec = SourceSpec(SOURCE_ID, src["name"], src["sheet"], src["hdr"], tuple(s for s, _ in match_pairs),
+                  tuple(d for _, d in match_pairs), MatchSettings(90, 5, "strict" if exact else "recommended"),
+                  dict(copy_pairs), "overwrite" if replace else "fill_only_blank")
+for i in validate_setup([spec], dst_cols, {SOURCE_ID: src_cols}):
+    if i.severity == "error":
+        problems.append(i.message.split(": ", 1)[1] if i.message.startswith(spec.label + ": ") else i.message)
+if problems:
+    for message in dict.fromkeys(problems):
+        st.error(message)
+    st.stop()
 
-with st.expander("What do these results mean?"):
-    st.markdown("\n".join(f"- **{label}**: {text}" for label, (_, text) in RESULTS.items()))
-
-with st.expander("See every record"):
-    present = [l for l in RESULTS if counts.get(l, 0)]
-    chosen = st.multiselect("Show", present, default=[l for l in present if l != "Matched"])
-    view = res[labels.isin(chosen)]
-    _wide(st.dataframe, pd.DataFrame({
-        "Row": [int(dst_df.loc[i, HIDDEN]) for i in view["_dst_index"]],
-        "Record": [_text(dst_df, i, dst_keys) for i in view["_dst_index"]],
-        "Result": [STATUS[s][0] for s in view["status"]],
-        "Details": [STATUS[s][2] for s in view["status"]],
-        "Similarity": view["match_score"].values,
-    }), hide_index=True)
-
-# ---------------------------------------------------------------- 3. what to copy
+# ---------------------------------------------------------------- 4. preview
 st.divider()
-_step(3, "Choose what to copy",
-      "Select the columns to copy from the source file, then choose where each one goes in the destination workbook. "
-      "Cells with formulas are never changed, and empty source cells are never copied.")
-picked = st.multiselect("Columns to copy from the source file", _cols(src_df), key="map_src")
-dst_cols = _cols(dst_df)
-mapping = {}
-if picked:
-    h1, h2 = st.columns(2, gap="large")
-    h1.caption("Source column")
-    h2.caption("Copy into this destination column")
-for col in picked:
-    a, b = st.columns(2, gap="large")
-    a.markdown(f"<div style='padding-top:.45rem'>{col}</div>", unsafe_allow_html=True)
-    mapping[col] = b.selectbox(f"Destination column for {col}", dst_cols,
-                               index=dst_cols.index(col) if col in dst_cols else 0,
-                               key=f"map_{col}", label_visibility="collapsed")
+_step(4, "Preview", "This is what will change. Nothing is saved until you download.")
+msig = _sig(dest.signature, _digest(src["data"]), src["sheet"], src["hdr"], spec.src_keys, spec.dst_keys, spec.settings.mode)
+try:
+    with st.spinner("Looking for matching rows"):
+        res = _match(msig, dest, spec, src["table"])
+except Exception as e:
+    st.error(_friendly(e, "We couldn't compare the two files. Check the columns you selected and try again."))
+    st.stop()
 
-dup_targets = len(set(mapping.values())) != len(mapping)
-if dup_targets:
-    st.warning("Each destination column can receive values from only one source column.")
-
-strategy_label = st.radio("If a cell in the destination already has a value", list(STRATEGIES), horizontal=True)
-strategy = STRATEGIES[strategy_label]
-if strategy == "overwrite":
-    st.caption("Existing values will be replaced. You will see every change before anything is saved.")
-
-# ---------------------------------------------------------------- 4. review
-st.divider()
-_step(4, "Review your changes", "Confirm any possible matches, then check exactly what will change.")
+summary_box = st.container()
 fuzzy = res[res["status"] == "FUZZY"]
-accepted = set()
+approved = frozenset()
 if len(fuzzy):
-    st.markdown("**Records that need your confirmation**")
-    st.caption("These records look similar but are not identical. Tick Confirm when the two records are the same. "
-               "Nothing is copied for records you leave unticked.")
-    review = pd.DataFrame(
-        {
-            "Record in destination file": [_text(dst_df, i, dst_keys) for i in fuzzy["_dst_index"]],
-            "Possible match in source file": [_text(src_df, i, src_keys) for i in fuzzy["_suggested_src_index"]],
-            "Similarity (0-100)": fuzzy["match_score"].values,
-            "Confirm": False,
-        },
-        index=fuzzy["_dst_index"].values,
-    )
-    edited = _wide(
-        st.data_editor, review, key=f"review_{m['sig']}",
-        disabled=["Record in destination file", "Possible match in source file", "Similarity (0-100)"],
-        column_config={"Similarity (0-100)": st.column_config.NumberColumn(format="%.0f"),
-                       "Confirm": st.column_config.CheckboxColumn(default=False)},
-    )
-    accepted = set(edited.index[edited["Confirm"]])
-    st.caption(f"{len(accepted)} of {len(fuzzy)} confirmed")
-else:
-    st.caption("No records need your confirmation.")
+    with st.expander("1 row looks similar. Check it." if len(fuzzy) == 1 else f"{len(fuzzy)} rows look similar. Check them."):
+        st.caption("These rows are not exactly the same, but they look alike. Tick Same row for the ones that match. "
+                   "Nothing is copied for rows you leave unticked.")
+        review = pd.DataFrame({
+            "Row in the destination file": [_text(dest.table, i, spec.dst_keys) for i in fuzzy["_dst_index"]],
+            "Looks like this row in the source file": [_text(src["table"], i, spec.src_keys) for i in fuzzy["_suggested_src_index"]],
+            "Same row": False,
+        }, index=fuzzy["_dst_index"].values)
+        edited = _wide(st.data_editor, review, key=f"review_{msig}",
+                       disabled=["Row in the destination file", "Looks like this row in the source file"],
+                       column_config={"Same row": st.column_config.CheckboxColumn(default=False)})
+        approved = frozenset(edited.index[edited["Same row"]])
 
-plan_sig = _sig(m["sig"], strategy, tuple(sorted(mapping.items(), key=str)), tuple(sorted(accepted, key=str)))
+psig = _sig(msig, spec.strategy, tuple(sorted(spec.mapping.items())), tuple(sorted(approved, key=str)))
+entry0 = SourceEntry(spec, src["table"], res, approved)
+try:
+    with st.spinner("Working out the changes"):
+        entry = SourceEntry(spec, src["table"], res, approved, _plan(psig, dest, entry0))
+except Exception as e:
+    st.error(_friendly(e, "We couldn't work out the changes. Check the columns you chose and try again."))
+    st.stop()
+cons = consolidate(dest, [entry])
 
-p = st.session_state.get("plan")
-if p and p["sig"] != plan_sig:  # columns, existing-value choice or confirmations changed since the review
-    st.session_state.pop("plan", None)
-    st.session_state["plan_stale"] = True
+not_matched = []
+for _, r in res.iterrows():
+    status, d = r["status"], r["_dst_index"]
+    if status in ("EXACT", "NORMALIZED") or (status == "FUZZY" and d in approved):
+        continue
+    not_matched.append({
+        "Row in the destination file": int(dest.table.loc[d, HIDDEN]),
+        "Record": _text(dest.table, d, spec.dst_keys),
+        "Why": "Looks similar to a row in the source file, but not confirmed" if status == "FUZZY" else STATUS_LABELS[status][1]})
+with summary_box:
+    _stats(len(res) - len(not_matched), len(cons.updates), len(not_matched))
+    if not cons.updates and not cons.blockers:
+        _note("Nothing would change with these choices. Open the details to see why.")
+    for b in cons.blockers:
+        st.error(b.reason)
+    if cons.conflicts:
+        st.error("Some cells would receive different values. Check the columns you chose.")
 
-if not mapping:
-    st.caption("Choose at least one column to copy in step 3, then review your changes.")
-if st.button("Review changes", type="primary", disabled=not mapping or dup_targets):
-    try:
-        updates, skips = build_plan(dst_bytes, dst_sheet, res, src_df, dst_df, mapping,
-                                    strategy=strategy, accepted_rows=accepted)
-        st.session_state["plan"] = {"sig": plan_sig, "updates": updates, "skips": skips, "out": None}
-        st.session_state["plan_stale"] = False
-    except Exception as e:
-        st.error(_friendly(e, "We couldn't work out the changes. Check the columns you chose and try again."))
-
-p = st.session_state.get("plan")
-updates, skips = (p["updates"], p["skips"]) if p else ([], [])
-if not p and st.session_state.get("plan_stale"):
-    _note("Your selections have changed. Select Review changes to update this page.", top=True)
-
-if p:
-    if updates:
-        n = len(updates)
-        st.markdown(f"**{n:,} cell{'s' if n != 1 else ''} will be updated**")
-        _wide(st.dataframe, pd.DataFrame({
-            "Row": [_get(u, "row") for u in updates],
-            "Column": [_get(u, "column_name") for u in updates],
-            "Current value": [_blank(_get(u, "old_value")) for u in updates],
-            "New value": [_get(u, "new_value") for u in updates],
-        }).astype(str), hide_index=True)
-    else:
-        _note("No cells will be updated with these choices. The list below explains why.")
-
-    if skips:
-        with st.expander(f"Records and cells left unchanged ({len(skips):,})"):
-            st.caption("These records or cells will not be updated, and why.")
-            skipped = pd.DataFrame({
-                "Row": [int(dst_df.loc[s["destination_index"], HIDDEN]) for s in skips],
-                "Record": [_text(dst_df, s["destination_index"], dst_keys) for s in skips],
-                "Column": [s.get("column", "") for s in skips],
-                "Reason": [_skip_reason(s["reason"]) for s in skips],
-            })
-            _wide(st.dataframe, skipped["Reason"].value_counts().rename("Count").reset_index(), hide_index=True)
-            _wide(st.dataframe, skipped, hide_index=True)
+with st.expander("Show details"):
+    tabs = st.tabs(["Changes", "Rows not matched", "Cells left unchanged", "Unused rows in the source file"])
+    with tabs[0]:
+        if cons.updates:
+            _wide(st.dataframe, pd.DataFrame({
+                "Row": [u.row for u in cons.updates], "Column": [u.column_name for u in cons.updates],
+                "Current value": [_blank(u.old_value) for u in cons.updates], "New value": [u.new_value for u in cons.updates],
+            }).astype(str), hide_index=True)
+        else:
+            st.caption("No cells will be updated.")
+    with tabs[1]:
+        if not_matched:
+            st.caption("Nothing is copied for these rows.")
+            _wide(st.dataframe, pd.DataFrame(not_matched), hide_index=True)
+        else:
+            st.caption("Every row in the destination file found a match.")
+    with tabs[2]:
+        cells = [s for s in entry.plan.skips if "column" in s]
+        if cells:
+            _wide(st.dataframe, pd.DataFrame({
+                "Row": [int(dest.table.loc[s["destination_index"], HIDDEN]) for s in cells],
+                "Record": [_text(dest.table, s["destination_index"], spec.dst_keys) for s in cells],
+                "Column": [s["column"] for s in cells],
+                "Why": [_skip_reason(s["reason"]) for s in cells]}), hide_index=True)
+        else:
+            st.caption("Every matched cell will be updated.")
+    with tabs[3]:
+        unused = _unused(_sig(msig, tuple(sorted(approved, key=str))), entry)
+        if len(unused):
+            st.caption("These rows in the source file were not used for any row in the destination file.")
+            _wide(st.dataframe, unused, hide_index=True)
+        else:
+            st.caption("Every row in the source file was used.")
 
 # ---------------------------------------------------------------- 5. download
 st.divider()
-_step(5, "Download your workbook", "Download the updated Excel file and a report showing how every record was matched.")
-d1, d2 = st.columns(2, gap="large")
-with d1:
-    st.markdown("**Updated workbook**")
-    if p and updates:
-        st.caption("A copy of your destination workbook with the changes above. Your original file stays as it is.")
-        if st.button("Create updated workbook", type="primary"):
-            try:
-                with st.spinner("Creating your workbook"):
-                    p["out"] = apply_plan(dst_bytes, dst_sheet, p["updates"])
-            except Exception as e:
-                st.error(_friendly(e, "We couldn't create the workbook. Review your changes and try again."))
-        if p.get("out"):
-            _note("Your updated workbook is ready.")
-            st.download_button("Download updated workbook", p["out"],
-                               file_name=f"{os.path.splitext(dst_name)[0]}_updated.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    elif p:
-        st.caption("There are no changes to save, so no updated workbook was created. You can still download the matching report.")
-    else:
-        st.caption("Review your changes in step 4 to create the updated workbook.")
-with d2:
-    st.markdown("**Matching report**")
-    st.caption("A spreadsheet (CSV) listing every destination record, how it was matched and your decision on possible "
-               "matches. Possible matches you did not confirm are marked Not confirmed.")
-    st.download_button(
-        "Download matching report",
-        _report_csv(m["sig"], tuple(sorted(int(i) for i in accepted)), res, src_df, dst_df, src_keys, dst_keys),
-        file_name=f"{os.path.splitext(dst_name)[0]}_matching_report.csv",
-        mime="text/csv",
-    )
+_step(5, "Download", "You get an updated copy of your workbook. Your original file stays as it is.")
+stem = os.path.splitext(dst["name"])[0]
+if cons.can_apply:
+    out_sig = _sig(dest.signature, tuple((u.row, u.column, repr(u.new_value)) for u in cons.updates))
+    _download("Download updated workbook", _workbook(out_sig, dest, cons), file_name=f"{stem}_updated.xlsx",
+              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption("Cell values and formatting are kept as far as possible and formulas are never changed, but charts, "
+               "images and other embedded objects may not carry over, so check the result in Excel.")
+else:
+    st.caption("There is nothing to download yet. Choose columns that match and have values to copy.")
+report_sig = _sig(psig, tuple(sorted(approved, key=str)))
+st.download_button("Download matching report (CSV)", _report(report_sig, dest, [entry]), file_name=f"{stem}_matching_report.csv",
+                   mime="text/csv", key="report")
+st.caption("A list of every row in the destination file and how it was matched.")
